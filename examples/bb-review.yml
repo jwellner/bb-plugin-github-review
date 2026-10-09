@@ -1,0 +1,37 @@
+# Optional alternative to a repo webhook: forward `/bb-review` PR comments to
+# the bb GitHub Review plugin from GitHub Actions. Copy to
+# .github/workflows/bb-review.yml and set two repository secrets:
+#   BB_REVIEW_URL     public webhook URL (`bb github-review setup` prints it)
+#   BB_REVIEW_SECRET  the plugin's webhookSecret
+# The plugin still checks the keyword and the allowed users itself.
+name: bb review
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [ready_for_review]
+
+permissions: {}
+
+jobs:
+  forward:
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request && contains(github.event.comment.body, '/bb-review'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Forward the comment to bb
+        env:
+          BB_REVIEW_URL: ${{ secrets.BB_REVIEW_URL }}
+          BB_REVIEW_SECRET: ${{ secrets.BB_REVIEW_SECRET }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -c . "$GITHUB_EVENT_PATH")"
+          sig="sha256=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$BB_REVIEW_SECRET" -r | cut -d' ' -f1)"
+          curl --fail-with-body -sS -X POST "$BB_REVIEW_URL" \
+            -H 'content-type: application/json' \
+            -H "x-github-event: $GITHUB_EVENT_NAME" \
+            -H "x-github-delivery: actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -H "x-hub-signature-256: $sig" \
+            --data-binary "$payload"
