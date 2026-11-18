@@ -90,15 +90,19 @@ command with `-R "$R"` (or `repos/$R/...` for `gh api`).
 
 ## Setup and troubleshooting
 
-- `bb github-review setup` prints the local route, the public URL, the
-  Tailscale Funnel command, and the `gh api` command that creates a repo
-  webhook (events `issue_comment` and `pull_request`, content type JSON, shared secret).
+- `bb github-review setup [owner/repo] [--show-secret]` reports the repo (the
+  argument, else the current bb project or git checkout), its bb project, the
+  webhook state, the routes and the settings, then prints only the remaining
+  steps: the Tailscale Funnel command if `publicWebhookUrl` is unset, and the
+  `gh api` command that creates the webhook or adds its missing events. The
+  secret stays hidden unless `--show-secret` is passed. Don't pass that flag
+  unless the user asks, and never post the secret.
 - `bb github-review runs` lists recent runs with status and thread id.
 - `bb github-review review <owner/repo> <pr> [focus]` starts a review
   without GitHub (manual or for testing).
 - Settings (`bb plugin config github-review`): `webhookSecret`, `keyword`,
   `allowedUsers`, `reviewOnReadyForReview`, `commitStatus`, `statusContext`, `repoProjects` (`owner/repo=proj_id` overrides),
-  `postToGitHub`, `permissionMode`, `model`, `publicWebhookUrl`.
+  `postToGitHub`, `permissionMode`, `provider`, `model`, `reasoningLevel`, `publicWebhookUrl`.
 - A repo is reviewed in the bb project whose git remote matches it. Repos
   without a matching project are logged and skipped (status `skipped`).
 - Logs: `bb plugin logs github-review -f`. GitHub's webhook "Recent

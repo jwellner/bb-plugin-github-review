@@ -20,20 +20,32 @@ function commentPayload(overrides: { body?: string; login?: string; pr?: boolean
   };
 }
 
-async function setup(settings: Record<string, string | boolean> = { webhookSecret: SECRET, allowedUsers: "jwellner" }) {
+async function setup(
+  settings: Record<string, string | boolean> = { webhookSecret: SECRET, allowedUsers: "jwellner" },
+  hooks: () => Promise<{ id: number; url: string; events: string[]; active: boolean }[]> = async () => [],
+) {
   let spawned = 0;
   const { bb, harness } = createFakePluginHost({
     pluginId: "github-review",
     settings,
     sdk: {
       projects: {
+        defaultExecutionOptions: async () => ({ providerId: String(settings.projectProvider ?? "claude-code") }),
         list: async () => [{ id: "proj_web", gitRemoteUrl: "git@github.com:jwellner/website.git", sources: [{ hostId: "host_1", isDefault: true }] }],
       },
       threads: { spawn: async () => ({ id: `thr_${++spawned}` }) },
+      providers: {
+        list: async () => [
+          { id: "claude-code", capabilities: { permissionModes: ["accept-edits", "auto", "full"] } },
+          { id: "acp-cursor", capabilities: { permissionModes: ["accept-edits", "full"] } },
+        ],
+      },
     } as never,
   });
   const statuses: { repo: string; sha: string; state: string; context: string; description: string; targetUrl: string }[] = [];
   const github: GitHubClient = {
+    gitRemote: async (cwd) => (cwd === "/work/website" ? "git@github.com:jwellner/website.git" : null),
+    listHooks: hooks,
     headSha: async () => "a".repeat(40),
     setStatus: async (repo, sha, status) => void statuses.push({ repo, sha, ...status }),
   };
@@ -163,6 +175,61 @@ describe("webhook", () => {
   });
 });
 
+describe("review agent", () => {
+  it("uses the project defaults when nothing is set", async () => {
+    const { post, spawnCalls, settle } = await setup();
+    await post(commentPayload());
+    await settle();
+    const args = spawnCalls()[0]![0] as Record<string, unknown>;
+    expect(args).not.toHaveProperty("providerId");
+    expect(args).not.toHaveProperty("model");
+    expect(args).not.toHaveProperty("reasoningLevel");
+  });
+
+  it("passes the configured provider, model and reasoning level", async () => {
+    const { post, spawnCalls, settle } = await setup({
+      webhookSecret: SECRET,
+      allowedUsers: "jwellner",
+      provider: "codex",
+      model: "gpt-6.1-sol",
+      reasoningLevel: "high",
+    });
+    await post(commentPayload());
+    await settle();
+    expect(spawnCalls()[0]![0]).toMatchObject({
+      providerId: "codex",
+      model: "gpt-6.1-sol",
+      reasoningLevel: "high",
+    });
+  });
+});
+
+describe("permission mode", () => {
+  const spawnedMode = async (settings: Record<string, string | boolean>) => {
+    const { post, spawnCalls, settle } = await setup({ webhookSecret: SECRET, allowedUsers: "jwellner", ...settings });
+    await post(commentPayload());
+    await settle();
+    return (spawnCalls()[0]![0] as { permissionMode?: string }).permissionMode;
+  };
+
+  it("uses the configured mode when the provider supports it", async () => {
+    expect(await spawnedMode({})).toBe("auto");
+  });
+
+  it("falls back to the most restrictive supported mode", async () => {
+    expect(await spawnedMode({ projectProvider: "acp-cursor" })).toBe("accept-edits");
+    expect(await spawnedMode({ provider: "acp-cursor" })).toBe("accept-edits");
+  });
+
+  it("keeps an explicit mode the provider supports", async () => {
+    expect(await spawnedMode({ provider: "acp-cursor", permissionMode: "full" })).toBe("full");
+  });
+
+  it("passes no mode for project-default", async () => {
+    expect(await spawnedMode({ provider: "acp-cursor", permissionMode: "project-default" })).toBeUndefined();
+  });
+});
+
 describe("commit status", () => {
   async function started() {
     const ctx = await setup();
@@ -215,6 +282,52 @@ describe("commit status", () => {
     expect((await harness.behavior.runCli(["conclude", runId, "maybe"])).exitCode).toBe(1);
     expect((await harness.behavior.runCli(["conclude", runId, "success", "--url", "https://evil.example"])).exitCode).toBe(1);
     expect((await harness.behavior.runCli(["conclude", "nope", "success"])).exitCode).toBe(1);
+  });
+});
+
+describe("setup", () => {
+  const URL = "https://bb.example:8443/api/v1/plugins/github-review/http/webhook";
+  const base = { webhookSecret: SECRET, allowedUsers: "jwellner", publicWebhookUrl: URL };
+  const runSetup = async (
+    args: string[],
+    ctx: { cwd?: string; projectId?: string },
+    hooks?: () => Promise<{ id: number; url: string; events: string[]; active: boolean }[]>,
+  ) => {
+    const { harness } = await setup(base, hooks);
+    return harness.behavior.runCli(["setup", ...args], ctx as never);
+  };
+
+  it("detects the repo from the invoking bb project and hides the secret", async () => {
+    const out = (await runSetup([], { projectId: "proj_web" })).stdout ?? "";
+    expect(out).toContain("Repo:                jwellner/website  (from bb project");
+    expect(out).toContain("gh api repos/jwellner/website/hooks");
+    expect(out).toMatch(/config\[secret\]=\$\(cat '.*webhookSecret'\)|<secret: run with --show-secret>/);
+    expect(out).not.toContain(SECRET);
+  });
+
+  it("detects the repo from the cwd checkout", async () => {
+    const out = (await runSetup([], { cwd: "/work/website" })).stdout ?? "";
+    expect(out).toContain("jwellner/website  (from git remote in /work/website)");
+  });
+
+  it("prints the secret only with --show-secret", async () => {
+    const out = (await runSetup(["jwellner/website", "--show-secret"], {})).stdout ?? "";
+    expect(out).toContain(`config[secret]=${SECRET}`);
+  });
+
+  it("prints only the missing events for an existing hook", async () => {
+    const hooks = async () => [{ id: 42, url: URL, events: ["issue_comment"], active: true }];
+    const out = (await runSetup(["jwellner/website"], {}, hooks)).stdout ?? "";
+    expect(out).toContain("missing events: pull_request");
+    expect(out).toContain("gh api -X PATCH repos/jwellner/website/hooks/42 -f 'add_events[]=pull_request'");
+    expect(out).not.toContain("config[secret]");
+  });
+
+  it("says when the hook is complete", async () => {
+    const hooks = async () => [{ id: 42, url: URL, events: ["issue_comment", "pull_request"], active: true }];
+    const out = (await runSetup(["jwellner/website"], {}, hooks)).stdout ?? "";
+    expect(out).toContain("installed (id 42");
+    expect(out).toMatch(/^1\. Comment/m);
   });
 });
 

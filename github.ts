@@ -3,7 +3,18 @@ import { execFile } from "node:child_process";
 
 export type CommitState = "pending" | "success" | "failure" | "error";
 
+export interface RepoHook {
+  id: number;
+  url: string;
+  events: string[];
+  active: boolean;
+}
+
 export interface GitHubClient {
+  /** `origin` remote URL of the git checkout at `cwd`, or null. */
+  gitRemote(cwd: string): Promise<string | null>;
+  /** The repo's webhooks; throws without admin access. */
+  listHooks(repo: string): Promise<RepoHook[]>;
   headSha(repo: string, pr: number): Promise<string>;
   setStatus(
     repo: string,
@@ -18,16 +29,32 @@ export function statusDescription(text: string): string {
   return flat.length > 140 ? `${flat.slice(0, 139)}…` : flat;
 }
 
-function gh(args: string[]): Promise<string> {
+function run(command: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile("gh", args, { timeout: 30_000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) reject(new Error(`gh ${args[0]} ${args[1] ?? ""}: ${stderr.trim() || error.message}`));
+    execFile(command, args, { timeout: 30_000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) reject(new Error(`${command} ${args[0]} ${args[1] ?? ""}: ${stderr.trim() || error.message}`));
       else resolve(stdout.trim());
     });
   });
 }
 
+const gh = (args: string[]) => run("gh", args);
+
 export const ghClient: GitHubClient = {
+  async gitRemote(cwd) {
+    try {
+      return (await run("git", ["-C", cwd, "remote", "get-url", "origin"])) || null;
+    } catch {
+      return null;
+    }
+  },
+  async listHooks(repo) {
+    const out = await gh([
+      "api", `repos/${repo}/hooks`,
+      "--jq", "[.[] | {id, url: .config.url, events, active}]",
+    ]);
+    return JSON.parse(out || "[]") as RepoHook[];
+  },
   async headSha(repo, pr) {
     const sha = await gh(["api", `repos/${repo}/pulls/${pr}`, "--jq", ".head.sha"]);
     if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`unexpected head sha for ${repo}#${pr}`);

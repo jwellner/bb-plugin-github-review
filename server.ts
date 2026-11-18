@@ -10,6 +10,8 @@
 // when the review starts, then the agent's verdict (`bb github-review
 // conclude`), or error when the thread fails or ends without one.
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { type CommitState, type GitHubClient, ghClient } from "./github";
 import {
@@ -24,6 +26,8 @@ import {
 } from "./webhook";
 
 const WEBHOOK_PATH = "/webhook";
+
+type PermissionMode = "accept-edits" | "auto" | "full";
 
 interface RunRow {
   id: string;
@@ -109,11 +113,26 @@ export async function createPlugin(bb: BbPluginApi, github: GitHubClient) {
       options: ["auto", "accept-edits", "full", "project-default"],
       default: "auto",
     },
+    provider: {
+      type: "string",
+      label: "Provider",
+      description:
+        "Agent provider for review threads, e.g. `claude-code` or `codex` (see `bb provider list`). Blank uses the project default.",
+      default: "",
+    },
     model: {
       type: "string",
       label: "Model",
-      description: "Optional model id for review threads; blank uses the project default.",
+      description:
+        "Model id for review threads, e.g. `claude-opus-5-5` (see `bb provider models <provider>`). Blank uses the provider's default.",
       default: "",
+    },
+    reasoningLevel: {
+      type: "select",
+      label: "Reasoning level",
+      description: "Reasoning effort for review threads; `default` uses the provider's default.",
+      options: ["default", "low", "medium", "high", "xhigh", "max"],
+      default: "default",
     },
     publicWebhookUrl: {
       type: "string",
@@ -189,6 +208,37 @@ export async function createPlugin(bb: BbPluginApi, github: GitHubClient) {
     return { projectId: match.id, hostId: source?.hostId };
   }
 
+  /**
+   * The configured permission mode if the review's provider supports it.
+   * Otherwise use the most restrictive mode it does support. Never silently
+   * escalate to a broader one than needed.
+   */
+  async function reviewPermissionMode(
+    projectId: string,
+    provider: string,
+    wanted: string,
+  ): Promise<PermissionMode | undefined> {
+    if (wanted === "project-default") return undefined;
+    const mode = wanted as PermissionMode;
+    try {
+      const providerId =
+        provider || (await bb.sdk.projects.defaultExecutionOptions({ projectId }))?.providerId;
+      if (!providerId) return mode;
+      const info = (await bb.sdk.providers.list()).find((p) => p.id === providerId);
+      const supported = info?.capabilities.permissionModes ?? [];
+      if (supported.length === 0 || supported.includes(mode)) return mode;
+      const fallback = (["accept-edits", "auto", "full"] as const).find((m) => supported.includes(m))!;
+      bb.log.warn(
+        `Provider ${providerId} doesn't support permission mode ${mode}; using ${fallback}. ` +
+          `Set permissionMode to one of: ${supported.join(", ")}.`,
+      );
+      return fallback;
+    } catch (error) {
+      bb.log.warn(`Could not check provider permission modes: ${String(error)}`);
+      return mode;
+    }
+  }
+
   /** Record the run, then spawn the review thread. Returns the final run row. */
   async function startReview(request: ReviewRequest, runId: string): Promise<RunRow> {
     const commentId = request.commentId || null;
@@ -207,6 +257,7 @@ export async function createPlugin(bb: BbPluginApi, github: GitHubClient) {
       "starting", null, Date.now());
 
     const s = await settings.get();
+    const permissionMode = await reviewPermissionMode(project.projectId, s.provider, s.permissionMode);
     if (s.postToGitHub && s.commitStatus) {
       try {
         const sha = await github.headSha(request.repo, request.pr);
@@ -226,10 +277,12 @@ export async function createPlugin(bb: BbPluginApi, github: GitHubClient) {
         },
         title: `Review ${request.repo}#${request.pr}`,
         prompt: buildPrompt(request, s.postToGitHub, runId),
+        ...(s.provider ? { providerId: s.provider } : {}),
         ...(s.model ? { model: s.model } : {}),
-        ...(s.permissionMode !== "project-default"
-          ? { permissionMode: s.permissionMode as "auto" | "accept-edits" | "full" }
+        ...(s.reasoningLevel !== "default"
+          ? { reasoningLevel: s.reasoningLevel as "low" | "medium" | "high" | "xhigh" | "max" }
           : {}),
+        ...(permissionMode ? { permissionMode } : {}),
         pluginMetadata: { runId, repo: request.repo, pr: request.pr, commentId },
       });
       db.prepare(`UPDATE runs SET thread_id = ?, status = 'running' WHERE id = ?`)
@@ -338,28 +391,109 @@ export async function createPlugin(bb: BbPluginApi, github: GitHubClient) {
     return updated;
   }
 
-  async function setupText(): Promise<string> {
+  /** Which repo `setup` is about: an explicit arg, the invoking project, or the cwd checkout. */
+  async function setupRepo(
+    arg: string | undefined,
+    ctx: { cwd?: string; projectId?: string },
+  ): Promise<{ repo: string; source: string } | null> {
+    if (arg) return { repo: arg.toLowerCase(), source: "argument" };
+    if (ctx.projectId) {
+      const project = (await bb.sdk.projects.list()).find((p) => p.id === ctx.projectId);
+      const repo = repoFromRemote(project?.gitRemoteUrl);
+      if (repo) return { repo, source: `bb project ${project!.name}` };
+    }
+    if (ctx.cwd) {
+      const repo = repoFromRemote(await github.gitRemote(ctx.cwd));
+      if (repo) return { repo, source: `git remote in ${ctx.cwd}` };
+    }
+    return null;
+  }
+
+  async function setupText(
+    repoArg: string | undefined,
+    ctx: { cwd?: string; projectId?: string },
+    showSecret: boolean,
+  ): Promise<string> {
     const s = await settings.get();
     const routePath = `/api/v1/plugins/${bb.pluginId}/http${WEBHOOK_PATH}`;
     const local = `${bb.server.loopbackBaseUrl.replace(/\/$/, "")}${routePath}`;
     const publicUrl = s.publicWebhookUrl || `https://<public-host>${routePath}`;
-    return [
-      `Local webhook route: ${local}`,
-      `Public webhook URL:  ${publicUrl}`,
-      `Secret configured:   ${s.webhookSecret ? "yes" : "NO (run `bb plugin config github-review`)"}`,
-      `Keyword:             ${s.keyword}`,
-      `Allowed users:       ${s.allowedUsers}`,
-      "",
-      "1. Expose only the webhook path publicly, e.g. with Tailscale Funnel:",
-      `   sudo tailscale funnel --bg --https=8443 --set-path ${routePath} ${local}`,
-      "2. Add a repo webhook (needs admin on the repo):",
-      "   gh api repos/OWNER/REPO/hooks -f name=web -F active=true \\",
+    const secretFile = join(bb.server.experimental_dataDir, "plugins", bb.pluginId, "secrets", "webhookSecret");
+    const secretArg = !s.webhookSecret
+      ? "<secret>"
+      : showSecret
+        ? s.webhookSecret
+        : existsSync(secretFile)
+          ? `$(cat ${shellQuote(secretFile)})`
+          : "<secret: run with --show-secret>";
+
+    const target = await setupRepo(repoArg, ctx);
+    const repo = target?.repo ?? "OWNER/REPO";
+    const project = target ? await resolveProject(target.repo) : null;
+    const wanted = s.reviewOnReadyForReview ? ["issue_comment", "pull_request"] : ["issue_comment"];
+
+    let hookLine = "unknown (no repo detected)";
+    let hookSteps: string[];
+    const createSteps = [
+      `   gh api repos/${repo}/hooks -f name=web -F active=true \\`,
       `     -f 'config[url]=${publicUrl}' -f 'config[content_type]=json' \\`,
-      "     -f 'config[secret]=<secret>' -f 'events[]=issue_comment' -f 'events[]=pull_request'",
-      "   Or copy examples/bb-review.yml to .github/workflows/ and set the",
-      "   BB_REVIEW_URL and BB_REVIEW_SECRET repo secrets.",
-      `3. Comment \`${s.keyword}\` on a PR.`,
-    ].join("\n");
+      `     -f "config[secret]=${secretArg}" \\`,
+      `     ${wanted.map((e) => `-f 'events[]=${e}'`).join(" ")}`,
+    ];
+    hookSteps = createSteps;
+    if (target && s.publicWebhookUrl) {
+      try {
+        const hook = (await github.listHooks(target.repo)).find((h) => h.url === s.publicWebhookUrl);
+        const missing = hook ? wanted.filter((e) => !hook.events.includes(e) && !hook.events.includes("*")) : [];
+        if (!hook) {
+          hookLine = "not installed";
+        } else if (missing.length > 0) {
+          hookLine = `installed (id ${hook.id}), missing events: ${missing.join(", ")}`;
+          hookSteps = [
+            `   gh api -X PATCH repos/${repo}/hooks/${hook.id} ${missing.map((e) => `-f 'add_events[]=${e}'`).join(" ")}`,
+          ];
+        } else {
+          hookLine = `installed (id ${hook.id}, events: ${hook.events.join(", ")})${hook.active ? "" : ", INACTIVE"}`;
+          hookSteps = [];
+        }
+      } catch {
+        hookLine = "unknown (can't list hooks: needs admin on the repo; an org-level hook also works)";
+      }
+    }
+
+    const lines = [
+      `Repo:                ${target ? `${target.repo}  (from ${target.source})` : "not detected; pass one: bb github-review setup OWNER/REPO"}`,
+      `bb project:          ${target ? (project ? project.projectId : "NONE: add a bb project for this repo, or set repoProjects") : "-"}`,
+      `Webhook on repo:     ${hookLine}`,
+      `Public webhook URL:  ${publicUrl}`,
+      `Local webhook route: ${local}`,
+      `Secret configured:   ${s.webhookSecret ? "yes" : "NO: bb plugin config github-review set webhookSecret \"$(openssl rand -hex 32)\""}`,
+      `Allowed users:       ${s.allowedUsers || "NONE: bb plugin config github-review set allowedUsers <login>"}`,
+      `Keyword:             ${s.keyword}`,
+      "",
+    ];
+    let step = 1;
+    if (!s.publicWebhookUrl) {
+      lines.push(
+        `${step++}. Expose only the webhook path publicly, e.g. with Tailscale Funnel, then save the URL:`,
+        `   sudo tailscale funnel --bg --https=8443 --set-path ${routePath} ${local}`,
+        `   bb plugin config github-review set publicWebhookUrl https://<host>:8443${routePath}`,
+      );
+    }
+    if (hookSteps.length > 0) {
+      lines.push(
+        `${step++}. ${hookSteps === createSteps ? "Add the webhook" : "Add the missing events"} to ${repo} (needs admin on the repo):`,
+        ...hookSteps,
+      );
+      if (hookSteps === createSteps) {
+        lines.push(
+          "   Or copy examples/bb-review.yml to .github/workflows/ and set the",
+          "   BB_REVIEW_URL and BB_REVIEW_SECRET repo secrets (`--show-secret` prints the secret).",
+        );
+      }
+    }
+    lines.push(`${step}. Comment \`${s.keyword}\` on a PR${s.reviewOnReadyForReview ? " or mark a draft ready for review" : ""}.`);
+    return lines.join("\n");
   }
 
   const usage = [
@@ -367,7 +501,7 @@ export async function createPlugin(bb: BbPluginApi, github: GitHubClient) {
     "  bb github-review review <owner/repo> <pr-number> [focus text…] [--json]",
     "  bb github-review runs [--json]",
     "  bb github-review conclude <run-id> <success|failure> [--url <review-url>] [summary…]",
-    "  bb github-review setup",
+    "  bb github-review setup [owner/repo] [--show-secret]",
   ].join("\n");
 
   bb.cli.register({
@@ -385,9 +519,13 @@ export async function createPlugin(bb: BbPluginApi, github: GitHubClient) {
         summary: "Record a review's verdict and update its PR check (used by review threads)",
         usage: "bb github-review conclude <run-id> <success|failure> [--url <review-url>] [summary…]",
       },
-      { name: "setup", summary: "Print webhook setup instructions", usage: "bb github-review setup" },
+      {
+        name: "setup",
+        summary: "Print webhook setup steps for the current (or given) repo",
+        usage: "bb github-review setup [owner/repo] [--show-secret]",
+      },
     ],
-    async run(argv) {
+    async run(argv, ctx) {
       const json = argv.includes("--json");
       const [command, ...args] = argv.filter((arg) => arg !== "--json");
       switch (command) {
@@ -462,8 +600,12 @@ export async function createPlugin(bb: BbPluginApi, github: GitHubClient) {
               : `Recorded ${verdict} for ${run.repo}#${run.pr}${run.head_sha ? "" : " (no commit status: head sha unknown)"}`,
           };
         }
-        case "setup":
-          return { exitCode: 0, stdout: await setupText() };
+        case "setup": {
+          const showSecret = args.includes("--show-secret");
+          const [repoArg, ...extra] = args.filter((a) => a !== "--show-secret");
+          if (extra.length > 0 || (repoArg && !/^[\w.-]+\/[\w.-]+$/.test(repoArg))) break;
+          return { exitCode: 0, stdout: await setupText(repoArg, ctx ?? {}, showSecret) };
+        }
       }
       return { exitCode: 1, stderr: usage };
     },
@@ -500,4 +642,8 @@ export function buildPrompt(request: ReviewRequest, postToGitHub: boolean, runId
     );
   }
   return lines.join("\n");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

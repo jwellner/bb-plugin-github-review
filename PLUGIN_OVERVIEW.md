@@ -5,7 +5,8 @@ Comment `/bb-review` on a GitHub pull request and bb reviews it.
 - A webhook endpoint that GitHub calls when someone comments on a PR.
 - A bb thread per review, in a fresh worktree of the matching project.
 - One review comment posted back to the PR, with 👀 → 👍 reactions on the trigger comment.
-- A `bb github-review` command: start a review by hand, list runs, print setup steps.
+- A choice of provider, model and reasoning level for review threads.
+- A `bb github-review` command: start a review by hand, list runs, check a repo's setup.
 
 ## How it works
 
